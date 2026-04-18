@@ -14,16 +14,75 @@ For more information, please see our preprint, [Accelerating Biomolecular Modeli
 This guide provides instructions on preparing inputs and running inference for RF3. 
 
 ##  Installation, Setup, and a Basic Prediction
-If you have already installed all of the models available in Foundry and downloaded the available model weights (see the [Foundry README](../../README.md) for details), skip [here](#c-run-a-test-prediction). 
+If you have already installed all of the models available in Foundry and downloaded the available model weights (see the [Foundry README](../../README.md) for details), skip [here](#e-run-a-test-prediction).
 
-### A. Installation
+The commands below assume Linux x86_64. RF3 requires Python `>=3.12,<3.13`; on Linux, the `rf3` extra also installs the CUDA 12 PyTorch and cuEquivariance wheels needed for GPU inference. If you already have a working conda installation, start at [B. Create the RF3 conda environment](#b-create-the-rf3-conda-environment).
 
-If you would like to install only RF3: 
+### A. Install Miniconda
+
+Install the latest Miniconda for Linux x86_64:
+
 ```bash
-pip install rc-foundry[rf3]
+mkdir -p ~/Downloads/miniconda-installer
+curl -fsSLo ~/Downloads/miniconda-installer/Miniconda3-latest-Linux-x86_64.sh \
+  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash ~/Downloads/miniconda-installer/Miniconda3-latest-Linux-x86_64.sh -b -p "$HOME/miniconda3" -c
+source ~/.bashrc
+conda config --set auto_activate_base false
 ```
 
-### B. Download model weights for RF3
+If conda requires Terms of Service acceptance for the default channels before creating environments, review the channel terms and run:
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+
+Verify conda is available:
+
+```bash
+conda --version
+conda info --base
+```
+
+### B. Create the RF3 conda environment
+
+```bash
+conda create -y -n foundry-rf3 python=3.12 pip
+conda activate foundry-rf3
+```
+
+### C. Install RF3
+
+For a released RF3-only install:
+
+```bash
+pip install "rc-foundry[rf3]"
+```
+
+For a local checkout of this repository:
+
+```bash
+cd /path/to/foundry
+pip install -e ".[rf3]"
+```
+
+Verify that the CLI and CUDA path import correctly:
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda)"
+rf3 --help
+foundry --help
+```
+
+### D. Download model weights for RF3
+The recommended path for the latest RF3 checkpoint is the Foundry installer:
+
+```bash
+foundry install rf3
+foundry list-installed
+```
+
 > [!IMPORTANT]
 > If you downloaded the Foundry weights via 
 > ```bash
@@ -58,7 +117,7 @@ wget http://files.ipd.uw.edu/pub/rf3/rf3_foundry_09_21_preprint.ckpt
 > [!NOTE]
 > The inference API is identical across all checkpoints.
 
-### C. Run a test prediction
+### E. Run a test prediction
 > [!NOTE]
 > The input file in the example below includes a path to the MSA file required to run it. This path assumes that you are running this example from the Foundry root directory. 
 
@@ -642,4 +701,3 @@ view(atom_array)
 **Alternative viewing options:**
 - View in PyMol like normal, or using `pymol_remote`
 - Use the `view_pymol()` function for direct PyMol integration
-

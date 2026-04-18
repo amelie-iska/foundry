@@ -246,6 +246,9 @@ class RF3InferenceEngine(BaseInferenceEngine):
         num_steps: int = 50,
         # Templating, MSAs, etc.
         template_noise_scale: float = 1e-5,
+        template_noise_scale_atomized: float | None = None,
+        template_noise_scale_not_atomized: float | None = None,
+        p_provide_inter_molecule_distances: float = 0.0,
         raise_if_missing_msa_for_protein_of_length_n: int | None = None,
         # Conformer generation
         fallback_conformer_to_input_coords: bool = True,
@@ -265,6 +268,12 @@ class RF3InferenceEngine(BaseInferenceEngine):
           diffusion_batch_size: Number of structures to generate per input. Defaults to ``5``.
           num_steps: Number of diffusion steps. Defaults to ``50``.
           template_noise_scale: Noise scale for template coordinates. Defaults to ``1e-5``.
+          template_noise_scale_atomized: Override for atomized-token template noise scale.
+              If ``None``, falls back to ``template_noise_scale``.
+          template_noise_scale_not_atomized: Override for non-atomized-token template noise scale.
+              If ``None``, falls back to ``template_noise_scale``.
+          p_provide_inter_molecule_distances: Probability of keeping generic inter-molecule
+              template distances. Explicit pairwise template selections bypass this mask.
           raise_if_missing_msa_for_protein_of_length_n: Debug flag for MSA checking. Defaults to ``None``.
           fallback_conformer_to_input_coords: If True, residues with unknown CCD codes that fail
               conformer generation will use their input PDB coordinates (centered) instead of zeros.
@@ -296,6 +305,17 @@ class RF3InferenceEngine(BaseInferenceEngine):
                 "No MSA directories set (LOCAL_MSA_DIRS env var not found)"
             )
 
+        atomized_template_noise_scale = (
+            template_noise_scale
+            if template_noise_scale_atomized is None
+            else template_noise_scale_atomized
+        )
+        not_atomized_template_noise_scale = (
+            template_noise_scale
+            if template_noise_scale_not_atomized is None
+            else template_noise_scale_not_atomized
+        )
+
         super().__init__(
             transform_overrides={
                 "diffusion_batch_size": diffusion_batch_size,
@@ -304,9 +324,10 @@ class RF3InferenceEngine(BaseInferenceEngine):
                 "fallback_conformer_to_input_coords": fallback_conformer_to_input_coords,
                 "undesired_res_names": [],
                 "template_noise_scales": {
-                    "atomized": template_noise_scale,
-                    "not_atomized": template_noise_scale,
+                    "atomized": atomized_template_noise_scale,
+                    "not_atomized": not_atomized_template_noise_scale,
                 },
+                "p_provide_inter_molecule_distances": p_provide_inter_molecule_distances,
                 "allowed_chain_types_for_conditioning": None,
                 "protein_msa_dirs": [
                     {

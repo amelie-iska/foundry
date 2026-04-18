@@ -70,6 +70,15 @@ For an interactive Google Colab notebook walking through a basic design pipeline
   <img src="docs/_static/prot_dna.png" alt="Protein-DNA complex prediction" width="400">
 </div>
 
+**Local conda setup:** RF3 requires Python `>=3.12,<3.13`. For an isolated Linux setup from this checkout, install Miniconda, then run:
+
+```bash
+conda create -y -n foundry-rf3 python=3.12 pip
+conda activate foundry-rf3
+pip install -e ".[rf3]"
+rf3 --help
+```
+
 > *See [models/rf3/README.md](models/rf3/README.md) for complete documentation.*
 
 ### ProteinMPNN

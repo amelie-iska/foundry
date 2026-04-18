@@ -39,6 +39,108 @@ def _resolve_override(override_value, source_value, param_name: str, example_id:
     return override_value if override_value is not None else source_value
 
 
+def _normalize_template_pair_selections(
+    pair_selections: list[dict[str, str]] | None,
+) -> list[dict[str, str]] | None:
+    """Validate and normalize explicit pairwise template selections."""
+    if pair_selections is None:
+        return None
+
+    normalized: list[dict[str, str]] = []
+    for item in pair_selections:
+        if not isinstance(item, dict):
+            raise TypeError(
+                "template_pair_selections entries must be dictionaries with "
+                "'left' and 'right' keys."
+            )
+        left = item.get("left")
+        right = item.get("right")
+        if not isinstance(left, str) or not left.strip():
+            raise ValueError(
+                "Each template_pair_selections entry must include a non-empty "
+                "'left' selection string."
+            )
+        if not isinstance(right, str) or not right.strip():
+            raise ValueError(
+                "Each template_pair_selections entry must include a non-empty "
+                "'right' selection string."
+            )
+        normalized.append({"left": left.strip(), "right": right.strip()})
+
+    return normalized
+
+
+def _normalize_distance_constraints(
+    distance_constraints: list[dict[str, str | float | int]] | None,
+) -> list[dict[str, str | float | int]] | None:
+    """Validate and normalize explicit pairwise distance constraints."""
+    if distance_constraints is None:
+        return None
+
+    normalized: list[dict[str, str | float | int]] = []
+    for item in distance_constraints:
+        if not isinstance(item, dict):
+            raise TypeError(
+                "distance_constraints entries must be dictionaries with "
+                "'left', 'right', 'min_distance', and 'max_distance' keys."
+            )
+
+        left = item.get("left")
+        right = item.get("right")
+        if not isinstance(left, str) or not left.strip():
+            raise ValueError(
+                "Each distance_constraints entry must include a non-empty "
+                "'left' selection string."
+            )
+        if not isinstance(right, str) or not right.strip():
+            raise ValueError(
+                "Each distance_constraints entry must include a non-empty "
+                "'right' selection string."
+            )
+
+        try:
+            min_distance = float(item["min_distance"])
+            max_distance = float(item["max_distance"])
+        except KeyError as exc:
+            raise ValueError(
+                "Each distance_constraints entry must include both "
+                "'min_distance' and 'max_distance'."
+            ) from exc
+
+        if min_distance < 0.0:
+            raise ValueError("distance_constraints min_distance must be >= 0.0")
+        if max_distance <= min_distance:
+            raise ValueError(
+                "distance_constraints max_distance must be greater than min_distance"
+            )
+
+        noise_scale = item.get("noise_scale")
+        if noise_scale is not None:
+            noise_scale = float(noise_scale)
+            if noise_scale < 0.0:
+                raise ValueError("distance_constraints noise_scale must be >= 0.0")
+
+        priority = int(item.get("priority", 0))
+        label = item.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("distance_constraints label must be a string if provided")
+
+        normalized_item: dict[str, str | float | int] = {
+            "left": left.strip(),
+            "right": right.strip(),
+            "min_distance": min_distance,
+            "max_distance": max_distance,
+            "priority": priority,
+        }
+        if noise_scale is not None:
+            normalized_item["noise_scale"] = noise_scale
+        if label is not None:
+            normalized_item["label"] = label
+        normalized.append(normalized_item)
+
+    return normalized
+
+
 def extract_example_id_from_path(path: Path) -> str:
     """Extract example ID from file path."""
     path_str = str(path.name)
@@ -65,6 +167,8 @@ class InferenceInput:
     chain_info: dict
     example_id: str
     template_selection: list[str] | None = None
+    template_pair_selections: list[dict[str, str]] | None = None
+    distance_constraints: list[dict[str, str | float | int]] | None = None
     ground_truth_conformer_selection: list[str] | None = None
     cyclic_chains: list[str] | None = None
 
@@ -198,6 +302,12 @@ class InferenceInput:
             "template_selection",
             data["name"],
         )
+        final_template_pair_sel = _normalize_template_pair_selections(
+            data.get("template_pair_selections")
+        )
+        final_distance_constraints = _normalize_distance_constraints(
+            data.get("distance_constraints")
+        )
         final_conformer_sel = _resolve_override(
             ground_truth_conformer_selection,
             data.get("ground_truth_conformer_selection"),
@@ -210,6 +320,8 @@ class InferenceInput:
             chain_info=chain_info,
             example_id=data["name"],
             template_selection=final_template_sel,
+            template_pair_selections=final_template_pair_sel,
+            distance_constraints=final_distance_constraints,
             ground_truth_conformer_selection=final_conformer_sel,
         )
 
@@ -220,6 +332,8 @@ class InferenceInput:
         chain_info: dict | None = None,
         example_id: str | None = None,
         template_selection: list[str] | str | None = None,
+        template_pair_selections: list[dict[str, str]] | None = None,
+        distance_constraints: list[dict[str, str | float | int]] | None = None,
         ground_truth_conformer_selection: list[str] | str | None = None,
     ) -> "InferenceInput":
         """Create from AtomArray.
@@ -229,6 +343,8 @@ class InferenceInput:
           chain_info: Chain info dict. Defaults to extracted from atom_array.
           example_id: Example ID. Defaults to generated ID.
           template_selection: Template selection.
+          template_pair_selections: Explicit pairwise template selections.
+          distance_constraints: Explicit pairwise distance-range constraints.
           ground_truth_conformer_selection: Conformer selection.
 
         Returns:
@@ -263,6 +379,10 @@ class InferenceInput:
             chain_info=extracted_chain_info,
             example_id=example_id or f"inference_{id(atom_array)}",
             template_selection=template_selection,
+            template_pair_selections=_normalize_template_pair_selections(
+                template_pair_selections
+            ),
+            distance_constraints=_normalize_distance_constraints(distance_constraints),
             ground_truth_conformer_selection=ground_truth_conformer_selection,
         )
 
@@ -288,6 +408,8 @@ class InferenceInput:
             "example_id": self.example_id,
             "atom_array": atom_array,
             "chain_info": self.chain_info,
+            "template_pair_selections": self.template_pair_selections,
+            "distance_constraints": self.distance_constraints,
         }
 
 

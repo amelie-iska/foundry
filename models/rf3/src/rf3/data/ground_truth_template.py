@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from atomworks.enums import ChainType
+from atomworks.io.utils.selection import AtomSelectionStack
 from atomworks.ml.transforms._checks import (
     check_atom_array_annotation,
     check_contains_keys,
@@ -70,12 +71,202 @@ DEFAULT_DISTOGRAM_BINS: Final[Float[Tensor, "63"]] = torch.concat(
         torch.arange(4.0, 20.5, 0.5, device="cpu"),
     )
 )
-"""
-Default bins for discretizing distances in the distogram (in Angstrom).
-    - 0.1A resolution from 1.0 -  4.0 A
-    - 0.5A resolution from 4.0 - 20.0 A
-Total number of bins: 64  (i.e. 63 bin boundaries above)
-"""
+# Default bins for discretizing distances in the distogram (in Angstrom).
+# - 0.1A resolution from 1.0 - 4.0 A
+# - 0.5A resolution from 4.0 - 20.0 A
+# Total number of bins: 64 (i.e. 63 bin boundaries above)
+
+
+def _token_mask_from_selection_query(
+    atom_array: AtomArray,
+    token_starts: np.ndarray,
+    selection_query: str,
+) -> np.ndarray:
+    """Project an atom-level selection query onto token-level membership."""
+    atom_mask = AtomSelectionStack.from_query(selection_query).get_mask(atom_array)
+    return np.add.reduceat(atom_mask.astype(np.int8), token_starts) > 0
+
+
+def _build_explicit_pairwise_template_mask(
+    atom_array: AtomArray,
+    token_starts: np.ndarray,
+    selection_pairs: list[dict[str, str]] | None,
+    eligible_token_mask: np.ndarray,
+) -> np.ndarray:
+    """Create a token-pair mask from explicit selection pairs."""
+    n_tokens = len(token_starts)
+    pair_mask = np.zeros((n_tokens, n_tokens), dtype=bool)
+    if not selection_pairs:
+        return pair_mask
+
+    for selection_pair in selection_pairs:
+        left_query = selection_pair.get("left")
+        right_query = selection_pair.get("right")
+        if not left_query or not right_query:
+            continue
+        try:
+            left_token_mask = _token_mask_from_selection_query(
+                atom_array, token_starts, left_query
+            )
+            right_token_mask = _token_mask_from_selection_query(
+                atom_array, token_starts, right_query
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse explicit template pair selection %s: %s",
+                selection_pair,
+                exc,
+            )
+            continue
+
+        left_token_mask &= eligible_token_mask
+        right_token_mask &= eligible_token_mask
+        if not left_token_mask.any() or not right_token_mask.any():
+            continue
+
+        pair_mask |= np.outer(left_token_mask, right_token_mask)
+        pair_mask |= np.outer(right_token_mask, left_token_mask)
+
+    return pair_mask
+
+
+def _interval_distogram_distribution(
+    min_distance: float,
+    max_distance: float,
+    distogram_bins: torch.Tensor,
+) -> Tensor:
+    """Create a normalized distribution over distogram bins for a distance interval."""
+    device = distogram_bins.device
+    dtype = distogram_bins.dtype
+
+    lower_edges = torch.cat(
+        [torch.tensor([float("-inf")], device=device, dtype=dtype), distogram_bins]
+    )
+    upper_edges = torch.cat(
+        [distogram_bins, torch.tensor([float("inf")], device=device, dtype=dtype)]
+    )
+    overlaps = (upper_edges > min_distance) & (lower_edges < max_distance)
+
+    distribution = overlaps.to(torch.float32)
+    if distribution.sum() == 0:
+        midpoint = (min_distance + max_distance) / 2.0
+        nearest_bin = torch.bucketize(
+            torch.tensor(midpoint, device=device, dtype=dtype),
+            boundaries=distogram_bins,
+        ).item()
+        distribution = torch.nn.functional.one_hot(
+            torch.tensor(nearest_bin, device=device),
+            num_classes=len(distogram_bins) + 1,
+        ).to(torch.float32)
+    else:
+        distribution = distribution / distribution.sum()
+
+    return distribution
+
+
+def _apply_explicit_distance_constraints(
+    atom_array: AtomArray,
+    distogram_bins: torch.Tensor,
+    template_features: dict[str, Tensor],
+    distance_constraints: list[dict[str, str | float | int]] | None,
+) -> dict[str, Tensor]:
+    """Merge explicit distance-range constraints into distogram conditioning features."""
+    if not distance_constraints:
+        return template_features
+
+    token_starts = get_token_starts(atom_array)
+    center_token_mask = get_af3_token_center_masks(atom_array)
+    resolved_tokens_mask = atom_array.occupancy[center_token_mask] > 0
+    n_token = len(token_starts)
+
+    distogram_condition = template_features["distogram_condition"].clone()
+    has_distogram_condition = template_features["has_distogram_condition"].clone()
+    noise_scale = template_features["distogram_condition_noise_scale"].clone()
+
+    current_priority = torch.full(
+        (n_token, n_token),
+        fill_value=torch.iinfo(torch.int32).min,
+        dtype=torch.int32,
+    )
+    current_width = torch.full((n_token, n_token), fill_value=float("inf"))
+
+    resolved_token_mask_ii = np.outer(resolved_tokens_mask, resolved_tokens_mask)
+
+    for constraint in distance_constraints:
+        left_query = constraint["left"]
+        right_query = constraint["right"]
+        min_distance = float(constraint["min_distance"])
+        max_distance = float(constraint["max_distance"])
+        priority = int(constraint.get("priority", 0))
+        interval_width = max_distance - min_distance
+        constraint_noise_scale = float(
+            constraint.get("noise_scale", max(0.25, min(1.25, interval_width / 4.0)))
+        )
+
+        try:
+            left_token_mask = _token_mask_from_selection_query(
+                atom_array, token_starts, str(left_query)
+            )
+            right_token_mask = _token_mask_from_selection_query(
+                atom_array, token_starts, str(right_query)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to parse explicit distance constraint %s: %s",
+                constraint,
+                exc,
+            )
+            continue
+
+        pair_mask_np = np.outer(left_token_mask, right_token_mask) | np.outer(
+            right_token_mask, left_token_mask
+        )
+        pair_mask_np &= resolved_token_mask_ii
+        if not pair_mask_np.any():
+            continue
+
+        pair_mask = torch.as_tensor(pair_mask_np, dtype=torch.bool)
+        priority_tensor = torch.full_like(current_priority, fill_value=priority)
+        width_tensor = torch.full_like(current_width, fill_value=interval_width)
+
+        should_overwrite = pair_mask & (
+            (priority_tensor > current_priority)
+            | (
+                (priority_tensor == current_priority)
+                & (width_tensor < current_width)
+            )
+        )
+
+        if should_overwrite.any():
+            distribution = _interval_distogram_distribution(
+                min_distance=min_distance,
+                max_distance=max_distance,
+                distogram_bins=distogram_bins,
+            ).to(distogram_condition.device)
+            distogram_condition[should_overwrite] = distribution
+            current_priority[should_overwrite] = priority
+            current_width[should_overwrite] = interval_width
+
+        has_distogram_condition[pair_mask] = True
+
+        token_mask_np = pair_mask_np.any(axis=0) | pair_mask_np.any(axis=1)
+        token_mask = torch.as_tensor(token_mask_np, dtype=torch.bool)
+        if token_mask.any():
+            zero_mask = token_mask & (noise_scale == 0)
+            noise_scale[zero_mask] = constraint_noise_scale
+            positive_mask = token_mask & (noise_scale > 0)
+            noise_scale[positive_mask] = torch.minimum(
+                noise_scale[positive_mask],
+                torch.full_like(
+                    noise_scale[positive_mask],
+                    fill_value=constraint_noise_scale,
+                ),
+            )
+
+    template_features["distogram_condition"] = distogram_condition
+    template_features["has_distogram_condition"] = has_distogram_condition
+    template_features["distogram_condition_noise_scale"] = noise_scale
+    return template_features
 
 
 def wrap_probability_distribution(
@@ -222,6 +413,7 @@ def featurize_noised_ground_truth_as_template_distogram(
     p_condition_per_token: float = 0.0,
     p_provide_inter_molecule_distances: float = 0.0,
     existing_annotation_to_check: str = "is_input_file_templated",
+    template_pair_selections: list[dict[str, str]] | None = None,
 ) -> dict[str, Tensor]:
     """Featurize noised ground truth as a template distogram for conditioning.
 
@@ -247,6 +439,11 @@ def featurize_noised_ground_truth_as_template_distogram(
         existing_annotation_to_check (str):
             If this annotation exists in the AtomArray, we ALWAYS template where it is True.
             Useful for inference.
+        template_pair_selections (list[dict[str, str]] | None):
+            Optional explicit token-pair template selections, where each item is a
+            ``{"left": "...", "right": "..."}`` selection pair in AtomSelection syntax.
+            Distances for these selected token pairs are always added, even when generic
+            inter-molecule distances are masked.
 
     Returns:
         dict[str, Tensor]:
@@ -322,6 +519,21 @@ def featurize_noised_ground_truth_as_template_distogram(
 
     token_idxs_to_fill = np.where(token_to_fill_mask)[0]  # [n_token_to_fill] (int)
 
+    # Explicit pairwise selections are inference-only and should not override unconditional mode
+    explicit_pairwise_template_mask = np.zeros((_n_token, _n_token), dtype=bool)
+    if not is_unconditional and template_pair_selections:
+        eligible_token_mask = token_to_fill_mask | (
+            tokens_with_supported_chain_types_mask
+            & resolved_tokens_mask
+            & torch.isfinite(noise).all(dim=-1).numpy()
+        )
+        explicit_pairwise_template_mask = _build_explicit_pairwise_template_mask(
+            atom_array=atom_array,
+            token_starts=_a_token_starts,
+            selection_pairs=template_pair_selections,
+            eligible_token_mask=eligible_token_mask,
+        )
+
     # ... fill the template_distogram
     ix1, ix2 = np.ix_(token_idxs_to_fill, token_idxs_to_fill)
     template_distogram[ix1.astype(int), ix2.astype(int)] = torch.cdist(
@@ -342,8 +554,29 @@ def featurize_noised_ground_truth_as_template_distogram(
         )
 
         # ... mask inter-molecule distances
-        token_to_fill_mask_II[is_inter_molecule] = False
-        template_distogram[is_inter_molecule] = MASK_VALUE
+        mask_to_remove = is_inter_molecule & ~explicit_pairwise_template_mask
+        token_to_fill_mask_II[mask_to_remove] = False
+        template_distogram[mask_to_remove] = MASK_VALUE
+
+    # Add explicit interface-local distances after generic inter-molecule masking.
+    if explicit_pairwise_template_mask.any():
+        explicit_pairwise_template_mask &= torch.isfinite(noise).all(dim=-1).numpy()[
+            :, None
+        ]
+        explicit_pairwise_template_mask &= torch.isfinite(noise).all(dim=-1).numpy()[
+            None, :
+        ]
+        full_template_distances = torch.cdist(
+            noisy_center_coords,
+            noisy_center_coords,
+            compute_mode="donot_use_mm_for_euclid_dist",
+        )
+        template_distogram[explicit_pairwise_template_mask] = full_template_distances[
+            explicit_pairwise_template_mask
+        ]
+        token_to_fill_mask_II |= explicit_pairwise_template_mask
+        token_to_fill_mask |= explicit_pairwise_template_mask.any(axis=0)
+        token_to_fill_mask |= explicit_pairwise_template_mask.any(axis=1)
 
     # Discretize distances into bins (NaNs go to last bin)
     template_distogram_binned: Tensor = torch.bucketize(
@@ -453,6 +686,13 @@ class FeaturizeNoisedGroundTruthAsTemplateDistogram(Transform):
             is_unconditional=data.get("is_unconditional", False),
             p_condition_per_token=self.p_condition_per_token,
             existing_annotation_to_check=self.existing_annotation_to_check,
+            template_pair_selections=data.get("template_pair_selections"),
+        )
+        template_features = _apply_explicit_distance_constraints(
+            atom_array=atom_array,
+            distogram_bins=self.distogram_bins,
+            template_features=template_features,
+            distance_constraints=data.get("distance_constraints"),
         )
 
         # Add the template features to the `feats` dict
